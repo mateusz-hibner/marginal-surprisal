@@ -1,3 +1,8 @@
+"""Integration tests with real Hugging Face tokenizers and tiny models (need network access).
+
+The algorithm itself is checked offline against the paper's definitions in test_paper.py.
+"""
+
 import math
 
 import pytest
@@ -17,26 +22,40 @@ MODELS = {
 TOKENIZERS = {**MODELS, "qwen": "Qwen/Qwen2.5-0.5B"}
 
 
+def _load(loader, name):
+    try:
+        return loader.from_pretrained(name)
+    except OSError as e:  # offline / hub unreachable
+        pytest.skip(f"cannot download {name}: {e}")
+
+
 @pytest.fixture(scope="module", params=list(MODELS))
-def scorer(request):
+def model_and_tokenizer(request):
     name = MODELS[request.param]
     torch.manual_seed(0)
-    model = AutoModelForCausalLM.from_pretrained(name)
-    tokenizer = AutoTokenizer.from_pretrained(name)
-    return MarginalScorer(model, tokenizer, device=torch.device("cpu"))
+    return _load(AutoModelForCausalLM, name), _load(AutoTokenizer, name)
+
+
+@pytest.fixture(scope="module")
+def scorer(model_and_tokenizer):
+    model, tokenizer = model_and_tokenizer
+    # Tiny random models are nearly uniform, the worst case for pruning: with the paper's K=5
+    # the beam can lose every sequence that continues the string. Real LMs are far more peaked.
+    return MarginalScorer(model, tokenizer, device=torch.device("cpu"), beam_size=20)
 
 
 def canonical_log_prob(scorer: MarginalScorer, text: str) -> float:
+    """->p_Delta of the canonical tokenization (no EOS)."""
     ids = [scorer.start_id] + scorer.tokenizer.encode(text, add_special_tokens=False)
     with torch.no_grad():
         logits = scorer.model(torch.tensor([ids])).logits[0, :-1]
-    lp = torch.log_softmax(logits.float(), dim=-1)
+    lp = torch.log_softmax(logits.double(), dim=-1)
     return lp.gather(1, torch.tensor(ids[1:])[:, None]).sum().item()
 
 
 @pytest.mark.parametrize("family", list(TOKENIZERS))
 def test_surface_strings_round_trip(family):
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZERS[family])
+    tokenizer = _load(AutoTokenizer, TOKENIZERS[family])
     surfaces = token_surface_bytes(tokenizer)
     ids = tokenizer.encode(ACCENTED, add_special_tokens=False)
     pieces = [surfaces[i] for i in ids]
@@ -45,19 +64,24 @@ def test_surface_strings_round_trip(family):
     assert joined in (ACCENTED.encode(), (" " + ACCENTED).encode())
 
 
-def test_accented_text_has_lattice_path(scorer):
-    assert scorer.log_prob(ACCENTED) > -math.inf
+def test_accented_text_is_covered(scorer):
+    lp = scorer.prefix_log_probs(ACCENTED)
+    assert all(math.isfinite(x) for x in lp)
 
 
-@pytest.mark.parametrize("text", ["The cat sat on the mat", ACCENTED])
-def test_marginal_at_least_canonical(scorer, text):
-    assert scorer.log_prob(text) >= canonical_log_prob(scorer, text) - 1e-4
+def test_exact_prefix_prob_at_least_canonical(model_and_tokenizer):
+    """The canonical tokenization is one member of the prefix cover."""
+    model, tokenizer = model_and_tokenizer
+    exact = MarginalScorer(model, tokenizer, device=torch.device("cpu"), beam_size=None)
+    text = "The cat"
+    assert exact.prefix_log_probs(text)[-1] >= canonical_log_prob(exact, text) - 1e-6
 
 
-def test_chain_rule(scorer):
-    context, words = "The cat sat", ["on", "the"]
-    s1, s2 = scorer.surprisal(context, words)
-    full = scorer.log_prob(f"{context} {words[0]} {words[1]}")
-    ctx = scorer.log_prob(context)
-    assert s1 + s2 == pytest.approx(ctx - full, abs=1e-4)
-    assert s1 > 0 and s2 > 0
+def test_surprisal_is_finite_and_positive(scorer):
+    s1, s2 = scorer.surprisal("The cat sat", ["on", "the"])
+    assert 0 < s1 < math.inf and 0 < s2 < math.inf
+
+
+def test_log_prob_includes_eos(scorer):
+    text = "The cat"
+    assert scorer.log_prob(text) < scorer.prefix_log_probs(text)[-1]

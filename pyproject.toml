@@ -1,7 +1,7 @@
 [project]
 name = "marginal-surprisal"
-version = "0.1.0"
-description = "Word surprisal from causal LMs, marginalized over all tokenizations of the string"
+version = "0.2.0"
+description = "Character-level surprisal from causal LMs, marginalized over tokenizations (Giulianelli et al., 2024)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
