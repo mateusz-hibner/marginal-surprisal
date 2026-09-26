@@ -42,11 +42,13 @@ def token_surface_bytes(tokenizer: PreTrainedTokenizerBase) -> list[bytes | None
     SentencePiece byte fallback often split a multi-byte character such as "è" across tokens,
     and the canonical tokenization itself may use such partial-character tokens.
 
-    None is returned for special tokens and tokens with an empty surface.
+    None is returned for special tokens and tokens with an empty surface. Special tokens include
+    added tokens flagged as special (chat and image markers such as <|im_start|> or
+    <|image_pad|> in VLM tokenizers), which never stand for text.
     """
     n = len(tokenizer)
     ids = list(range(n))
-    special = set(tokenizer.all_special_ids)
+    special = special_token_ids(tokenizer)
     tokens = tokenizer.convert_ids_to_tokens(ids)
     byte_level = is_byte_level(tokenizer)
     decoded = tokenizer.batch_decode(
@@ -75,27 +77,54 @@ def token_surface_bytes(tokenizer: PreTrainedTokenizerBase) -> list[bytes | None
     return surfaces
 
 
+def special_token_ids(tokenizer: PreTrainedTokenizerBase) -> set[int]:
+    """Ids of special tokens: the tokenizer's special tokens plus added tokens marked special."""
+    special = set(tokenizer.all_special_ids)
+    added = getattr(tokenizer, "added_tokens_decoder", None) or {}
+    special.update(i for i, tok in added.items() if getattr(tok, "special", False))
+    return special
+
+
 def has_dummy_prefix(tokenizer: PreTrainedTokenizerBase) -> bool:
     """Whether the tokenizer silently prepends a space to the input (SentencePiece dummy prefix)."""
     tokens = tokenizer.tokenize("a")
     return bool(tokens) and tokens[0].startswith(_SP_SPACE)
 
 
-def start_token_id(tokenizer: PreTrainedTokenizerBase) -> int:
-    """Id the model conditions on at the start of a sequence.
+def start_token_id(tokenizer: PreTrainedTokenizerBase, processor=None) -> int:
+    """Id the model conditions on at the start of a text.
 
-    Uses whatever the tokenizer itself prepends (e.g. <s> for Llama, </s> for XGLM/OPT) and
-    falls back to bos, then eos, for tokenizers that prepend nothing (GPT-2, Pythia, Qwen).
+    In order of preference:
+      1. whatever the model's processor prepends to a text-only input (Molmo 2 inserts bos/eos);
+      2. whatever the tokenizer prepends (<s> for Llama, </s> for XGLM/OPT);
+      3. the bos token (GPT-2, Pythia);
+      4. <|endoftext|>, the document separator of tokenizers without bos (Qwen, incl. Qwen-VL);
+      5. the eos token.
+    Pass start_id to MarginalScorer to override.
     """
-    with_special = tokenizer.encode("a", add_special_tokens=True)
-    without_special = tokenizer.encode("a", add_special_tokens=False)
-    for k in range(len(with_special) - len(without_special) + 1):
-        if with_special[k : k + len(without_special)] == without_special:
-            if k > 0:
-                return with_special[0]
-            break
+    bare = tokenizer.encode("a", add_special_tokens=False)
+    candidates = []
+    if processor is not None:
+        try:
+            out = processor(text="a")
+            ids = out["input_ids"]
+            ids = ids[0] if ids and isinstance(ids[0], (list, tuple)) else ids
+            candidates.append([int(i) for i in ids])
+        except Exception:  # processors differ; fall back to the tokenizer
+            pass
+    candidates.append(tokenizer.encode("a", add_special_tokens=True))
+    for with_special in candidates:
+        for k in range(len(with_special) - len(bare) + 1):
+            if with_special[k : k + len(bare)] == bare:
+                if k > 0:
+                    return with_special[k - 1]
+                break
 
-    for tid in (tokenizer.bos_token_id, tokenizer.eos_token_id):
-        if tid is not None:
-            return tid
+    if tokenizer.bos_token_id is not None:
+        return tokenizer.bos_token_id
+    endoftext = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    if isinstance(endoftext, int) and endoftext != tokenizer.unk_token_id:
+        return endoftext
+    if tokenizer.eos_token_id is not None:
+        return tokenizer.eos_token_id
     raise ValueError("Tokenizer has no bos or eos token; pass start_id explicitly.")

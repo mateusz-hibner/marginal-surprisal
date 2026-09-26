@@ -15,15 +15,14 @@ uv add git+https://github.com/<user>/marginal-surprisal   # or: uv add --editabl
 ## Usage
 
 ```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from marginal_surprisal import MarginalScorer
 
-model = AutoModelForCausalLM.from_pretrained("gpt2")
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
-scorer = MarginalScorer(model, tokenizer)  # beam_size=5, as in the paper; None = exact
+scorer = MarginalScorer.from_pretrained("gpt2")  # beam_size=5, as in the paper; None = exact
 
 target, post_target = scorer.surprisal("The cat sat on the", ["mat", "yesterday"])
 ```
+
+An already loaded model works too: `MarginalScorer(model, tokenizer)`.
 
 - `surprisal(context, continuations, sep=" ")`: for each region `sep + continuation`, returns
   -log p(region | everything before it), in nats. Regions carry their leading whitespace.
@@ -31,6 +30,30 @@ target, post_target = scorer.surprisal("The cat sat on the", ["mat", "yesterday"
   the first `i` bytes.
 - `byte_log_probs(text)`: log p(next byte | preceding bytes) for every byte.
 - `log_prob(text)`: log p(text) of the complete string, i.e. followed by EOS.
+
+## Vision-language models (text only)
+
+VLMs are used as text-only language models: no image is passed, and their image and chat
+tokens are excluded from the vocabulary. `from_pretrained` loads them with their
+image-text-to-text class.
+
+```python
+scorer = MarginalScorer.from_pretrained("allenai/Molmo2-8B", trust_remote_code=True,
+                                        device_map="auto")
+scorer = MarginalScorer.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct", device_map="auto")
+scorer = MarginalScorer.from_pretrained("Qwen/Qwen3-VL-8B-Instruct", device_map="auto")
+```
+
+- **transformers version.** Molmo 2's custom code needs transformers 4.57.x (`<5`), which also
+  supports Qwen2.5-VL and Qwen3-VL. The lock file pins 4.57.1. The package itself works with
+  4.57 and 5.x.
+- **Start token.** Every text is conditioned on what the model's own processor prepends to text:
+  for Molmo 2 that is its bos token, which Ai2's converter sets equal to eos. For tokenizers that add nothing and have no bos, such as
+  Qwen-VL, it is `<|endoftext|>`, Qwen's document separator. Override with `start_id=`.
+- **Precision.** `dtype="auto"` loads bfloat16 weights for most VLMs. Their logits carry about
+  3 significant digits, so surprisals are only accurate to a few hundredths of a nat. Pass
+  `dtype=torch.float32` if that matters and memory allows.
+- **Check each new model** with `scripts/check_model.py` (below) before an experiment.
 
 ## What is computed
 
@@ -40,7 +63,7 @@ sequences whose decoding starts with σ, where only the last token may run past 
     →p(σ) = Σ_{δ ∈ C(σ)} →p_Δ(δ),   C(σ) = { δ₁…δₘ : κ(δ₁…δₘ₋₁) ≺ σ ⪯ κ(δ₁…δₘ) }
 
 Each token sequence is scored with the model conditioned on its **own** token history, starting
-from the token the tokenizer itself prepends (bos, or eos when it prepends nothing). Without pruning,
+from the model's start token (see above). Without pruning,
 the surprisal of a region is exactly `log →p(context) − log →p(context · region)`. So " mat" gets credit from `Ġmat`,
 `Ġm·at` and also `Ġmatter`, and the context is not assumed to end on a token boundary.
 
@@ -64,7 +87,9 @@ separate token sequences and are all counted.
 
 **Vocabulary.** Each id is mapped to its surface bytes with the tokenizer's own decoder.
 SentencePiece models (Llama-2, XGLM, Mistral, Gemma) see a leading dummy-prefix space, which is
-treated as part of the string. Special tokens other than EOS produce no text and are excluded.
+treated as part of the string. Special tokens produce no text and are excluded, including added
+tokens marked special (VLM image and chat markers). Tokens that have an input embedding but no
+logit, such as Molmo 2's image tokens, are never scored.
 
 **Cost.** Each step runs one batched forward pass for the at most K token sequences that end at
 that byte. There is no KV cache, so long texts cost roughly quadratic time.
@@ -78,7 +103,21 @@ uv run pytest
 `tests/test_paper.py` runs offline. It checks the scorer against independent brute-force
 implementations of the definitions above (prefix cover, string probability with EOS, normalization
 of the next-character distribution) and against a direct transcription of Vieira et al.'s pruned
-algorithm, for K = 1, 2, 3, 5. `tests/test_scorer.py` downloads real tokenizers and tiny models.
+algorithm, for K = 1, 2, 3, 5. `tests/test_vlm.py` also runs offline. It repeats those checks through
+tiny random Qwen2.5-VL and Qwen3-VL models, and checks padding, special-token handling, the start
+token and `from_pretrained`. `tests/test_scorer.py` downloads real tokenizers and tiny models.
+
+### Checking a real model
+
+```bash
+uv run python scripts/check_model.py allenai/Molmo2-8B --trust-remote-code --device-map auto
+```
+
+This loads the checkpoint and reports its start token and vocabulary. It then checks that the
+tokenizer's splits decode back to the text exactly, that padded batches match single sequences,
+and that exact mode equals a brute-force sum over the prefix cover. Finally it compares K = 5 with
+K = 20 on sample sentences. Differences of a few hundredths of a nat in bfloat16 are rounding;
+use `--dtype float32` to rule that out.
 
 ## Reproducing the paper
 

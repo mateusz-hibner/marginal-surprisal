@@ -74,6 +74,10 @@ class MarginalScorer:
             do not produce text (special tokens). Default: derived from the tokenizer.
         dummy_prefix: whether the tokenizer adds a leading space (SentencePiece). Default: detected.
         batch_size: max sequences per forward pass.
+        processor: the model's processor (VLMs). Only used to find the start token.
+
+    Vision-language models (Molmo 2, Qwen2.5-VL, Qwen3-VL, ...) work as text-only language models;
+    load them with `MarginalScorer.from_pretrained`.
     """
 
     def __init__(
@@ -88,6 +92,7 @@ class MarginalScorer:
         surfaces: list[bytes | None] | None = None,
         dummy_prefix: bool | None = None,
         batch_size: int = 32,
+        processor=None,
     ):
         if tokenizer is None and (surfaces is None or start_id is None):
             raise ValueError("Pass a tokenizer, or both `surfaces` and `start_id`.")
@@ -96,8 +101,8 @@ class MarginalScorer:
 
         self.model = model.eval()
         self.tokenizer = tokenizer
-        self.device = device if device is not None else next(model.parameters()).device
-        self.start_id = start_id if start_id is not None else start_token_id(tokenizer)
+        self.device = device if device is not None else _input_device(model)
+        self.start_id = start_id if start_id is not None else start_token_id(tokenizer, processor)
         self.eos_id = eos_id if eos_id is not None else getattr(tokenizer, "eos_token_id", None)
         if dummy_prefix is None:
             dummy_prefix = has_dummy_prefix(tokenizer) if tokenizer is not None else False
@@ -107,15 +112,16 @@ class MarginalScorer:
 
         if surfaces is None:
             surfaces = token_surface_bytes(tokenizer)
-        output_embeddings = model.get_output_embeddings()
-        n_logits = output_embeddings.weight.shape[0] if output_embeddings is not None else None
+        # Size of the output distribution, read off a real forward pass: VLMs can have more input
+        # embeddings than logits (Molmo 2's image tokens), and not every model exposes its head.
+        n_logits = self._forward([()])[0].shape[-1]
 
         # Vocabulary sorted by surface: the tokens whose surface starts with r form one contiguous
         # range, found by binary search; duplicates (several ids, one surface) sit side by side.
         pairs = sorted(
             (surf, tid)
             for tid, surf in enumerate(surfaces)
-            if surf and (n_logits is None or tid < n_logits)
+            if surf and tid < n_logits
         )
         if not pairs:
             raise ValueError("No token has a surface string.")
@@ -253,10 +259,9 @@ class MarginalScorer:
         hi = len(self._surfaces) if succ is None else bisect.bisect_left(self._surfaces, succ, lo=mid)
         return lo, mid, hi
 
-    def _next_log_probs(self, seqs, want_eos=False):
-        """log p(. | start, *seq) for each seq, in sorted-surface order (and log p(EOS | ...))."""
-        sorted_lps: list[torch.Tensor] = []
-        eos_lps: list[float] = []
+    def _forward(self, seqs) -> list[torch.Tensor]:
+        """Full-vocabulary log p(. | start, *seq) for each seq, as float64 on the CPU."""
+        out: list[torch.Tensor] = []
         for i in range(0, len(seqs), self.batch_size):
             chunk = seqs[i : i + self.batch_size]
             lengths = [len(seq) + 1 for seq in chunk]
@@ -269,15 +274,90 @@ class MarginalScorer:
             # Right padding: with causal attention the real positions never see the padding.
             with torch.no_grad():
                 logits = self.model(
-                    input_ids=ids.to(self.device), attention_mask=mask.to(self.device)
+                    input_ids=ids.to(self.device),
+                    attention_mask=mask.to(self.device),
+                    use_cache=False,
                 ).logits
             last = logits[torch.arange(len(chunk)), torch.tensor(lengths) - 1]
-            lp = torch.log_softmax(last.double(), dim=-1).cpu()
-            if want_eos:
-                eos_lps.extend(lp[:, self.eos_id].tolist())
+            out.extend(torch.log_softmax(last.double(), dim=-1).cpu())
+        return out
+
+    def _next_log_probs(self, seqs, want_eos=False):
+        """log p(. | start, *seq) for each seq, in sorted-surface order (and log p(EOS | ...))."""
+        lps = self._forward(seqs)
+        if want_eos:
+            return [], [lp[self.eos_id].item() for lp in lps]
+        return [lp[self._ids] for lp in lps], []
+
+    # ----------------------------------------------------------------------------- loading
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        name_or_path: str,
+        *,
+        beam_size: int | None = 5,
+        trust_remote_code: bool = False,
+        dtype="auto",
+        device_map=None,
+        start_id: int | None = None,
+        **model_kwargs,
+    ) -> "MarginalScorer":
+        """Load a causal LM or a vision-language model from the Hugging Face Hub (or a local path).
+
+        VLMs such as Molmo 2 (trust_remote_code=True), Qwen2.5-VL and Qwen3-VL are loaded with
+        their image-text-to-text class and used as text-only language models: no image is ever
+        passed, and their image/chat special tokens are excluded from the vocabulary. The start
+        token is whatever the model's own processor prepends to text (see `start_token_id`).
+        """
+        import transformers
+
+        config = transformers.AutoConfig.from_pretrained(
+            name_or_path, trust_remote_code=trust_remote_code
+        )
+        multimodal = any(
+            getattr(config, attr, None) is not None
+            for attr in ("vision_config", "vit_config", "visual")
+        )
+        loaders = [transformers.AutoModelForCausalLM]
+        if hasattr(transformers, "AutoModelForImageTextToText"):
+            if multimodal:
+                loaders.insert(0, transformers.AutoModelForImageTextToText)
             else:
-                sorted_lps.extend(lp[:, self._ids])
-        return sorted_lps, eos_lps
+                loaders.append(transformers.AutoModelForImageTextToText)
+        kwargs = dict(trust_remote_code=trust_remote_code, dtype=dtype, **model_kwargs)
+        if device_map is not None:
+            kwargs["device_map"] = device_map
+        model, errors = None, []
+        for loader in loaders:
+            try:
+                model = loader.from_pretrained(name_or_path, **kwargs)
+                break
+            except (ValueError, KeyError) as e:  # config not mapped to this auto class
+                errors.append(f"{loader.__name__}: {e}")
+        if model is None:
+            raise ValueError(f"Could not load {name_or_path!r}:\n" + "\n".join(errors))
+
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            name_or_path, trust_remote_code=trust_remote_code
+        )
+        processor = None
+        if multimodal:
+            try:
+                processor = transformers.AutoProcessor.from_pretrained(
+                    name_or_path, trust_remote_code=trust_remote_code
+                )
+            except Exception:
+                processor = None
+        return cls(model, tokenizer, start_id=start_id, beam_size=beam_size, processor=processor)
+
+
+def _input_device(model: torch.nn.Module) -> torch.device:
+    """Device of the input embeddings (the first layer, also with device_map="auto")."""
+    try:
+        return next(model.get_input_embeddings().parameters()).device
+    except Exception:
+        return next(model.parameters()).device
 
 
 def _successor(r: bytes) -> bytes | None:

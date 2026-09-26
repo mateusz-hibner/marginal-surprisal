@@ -50,7 +50,7 @@ class ToyLM(torch.nn.Module):
     def get_output_embeddings(self):
         return self.out
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, **kwargs):
         logits = self.out(self.rnn(self.emb(input_ids))[0])
         if self.pad_logit is not None:
             logits[..., PAD] = self.pad_logit
