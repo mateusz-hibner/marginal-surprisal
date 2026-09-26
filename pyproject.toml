@@ -1,0 +1,27 @@
+[project]
+name = "marginal-surprisal"
+version = "0.1.0"
+description = "Word surprisal from causal LMs, marginalized over all tokenizations of the string"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.10.0",
+    "transformers>=5.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "sentencepiece>=0.2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.black]
+line-length = 100
+
+[tool.isort]
+profile = "black"
+line_length = 100
